@@ -364,6 +364,20 @@ def main() -> None:
             else:
                 print(f"[WARN] Original video not found for {base_video_id}")
 
+        # Strategy 1.5: Check if pre-segmented full-frame video exists in video_dir
+        # (With new pipeline: segment → normalize → mouth crop, video_dir contains full-frame segments)
+        if src is None:
+            segment_file = vdir / f"{uid}.mp4"
+            if segment_file.exists():
+                src = segment_file
+                print(f"[OK] Using pre-segmented full-frame video for {uid}: {segment_file.name}")
+            else:
+                # Try glob pattern for segment
+                hits = sorted(vdir.glob(f"{uid}*.mp4"))
+                if hits:
+                    src = hits[0]
+                    print(f"[OK] Using pre-segmented full-frame video for {uid}: {src.name}")
+
         # Strategy 2: Fall back to preprocessed segment video (mouth-cropped)
         if src is None and segment_dir:
             seg = segment_dir / f"{uid}.mp4"
