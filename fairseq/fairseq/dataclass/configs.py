@@ -741,6 +741,12 @@ class GenerationConfig(FairseqDataclass):
             "help": "generate sequences of maximum length ax + b, where x is the source length"
         },
     )
+    max_len: int = field(
+        default=0,
+        metadata={
+            "help": "maximum length of generated sequence (hard cap), 0 = use model default"
+        },
+    )
     min_len: int = field(
         default=1, metadata={"help": "minimum generation length"},
     )

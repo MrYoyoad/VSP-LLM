@@ -104,8 +104,25 @@ def _main(cfg, output_file):
         stream=output_file,
     )
     logger = logging.getLogger("hybrid.speech_recognize")
-    if output_file is not sys.stdout:  # also print to stdout
-        logger.addHandler(logging.StreamHandler(sys.stdout))
+    logger.propagate = False  # Prevent duplicate logging to root logger
+    logger.setLevel(logging.INFO)
+
+    # Add file/stdout handler
+    file_handler = logging.StreamHandler(output_file)
+    file_handler.setFormatter(logging.Formatter(
+        "%(asctime)s | %(levelname)s | %(name)s | %(message)s",
+        datefmt="%Y-%m-%d %H:%M:%S"
+    ))
+    logger.addHandler(file_handler)
+
+    # If outputting to file, also print to stdout
+    if output_file is not sys.stdout:
+        stdout_handler = logging.StreamHandler(sys.stdout)
+        stdout_handler.setFormatter(logging.Formatter(
+            "%(asctime)s | %(levelname)s | %(name)s | %(message)s",
+            datefmt="%Y-%m-%d %H:%M:%S"
+        ))
+        logger.addHandler(stdout_handler)
 
     utils.import_user_module(cfg.common)
 
@@ -139,7 +156,7 @@ def _main(cfg, output_file):
         task.cfg.data = cfg.override.data
     if cfg.override.label_dir is not None:
         task.cfg.label_dir = cfg.override.label_dir
-    task.load_dataset('test', task_cfg=cfg.task)
+    task.load_dataset(cfg.dataset.gen_subset, task_cfg=cfg.task)
 
     lms = [None]
 
@@ -198,8 +215,9 @@ def _main(cfg, output_file):
             continue
         
         sample['net_input']['source']['video'] = sample['net_input']['source']['video'].to(torch.half)
-        best_hypo = model.generate(target_list=sample["target"], 
-                                   num_beams=cfg.generation.beam, 
+        best_hypo = model.generate(target_list=sample["target"],
+                                   num_beams=cfg.generation.beam,
+                                   max_length=cfg.generation.max_len,
                                    length_penalty=cfg.generation.lenpen,
                                    **sample["net_input"])
         best_hypo = tokenizer.batch_decode(

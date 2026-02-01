@@ -5,8 +5,9 @@ common:
 generation:
   beam: 20
   lenpen: 0.0
-  max_len_a: 1.0
-  max_len_b: 0
+  max_len_a: 3.0    # Changed from 1.0 → allows 3x input length (EXPERIMENTAL - revert to 1.0 if issues)
+  max_len_b: 300    # Changed from 0 → adds 300-token buffer (EXPERIMENTAL - revert to 0 if issues)
+  max_len: 2048     # Hard cap - must be >= max_len_a * max_input + max_len_b (was 0 = use model default ~1024)
   lm_weight: 0
 
 common_eval:
