@@ -18,6 +18,7 @@ import editdistance
 from argparse import Namespace
 import pdb
 
+import gc
 import numpy as np
 import torch
 from fairseq import checkpoint_utils, options, tasks, utils, distributed_utils
@@ -170,6 +171,13 @@ def _main(cfg, output_file):
             model.avfeat_to_llm.cuda()
             model.half()
 
+    # Detect GPU memory for adaptive generation parameters
+    gpu_mem_gb = 0
+    if use_cuda:
+        gpu_mem_gb = torch.cuda.get_device_properties(0).total_memory / (1024**3)
+        logger.info(f"GPU memory: {gpu_mem_gb:.1f} GB")
+    small_gpu = gpu_mem_gb > 0 and gpu_mem_gb < 16
+
     # Load dataset (possibly sharded)
     cfg.dataset.batch_size = 1
     cfg.dataset.max_tokens = 1000
@@ -215,10 +223,23 @@ def _main(cfg, output_file):
             continue
         
         sample['net_input']['source']['video'] = sample['net_input']['source']['video'].to(torch.half)
+
+        # Dynamic max_length: proportional to input size, capped by max_len
+        src_tokens = sample['net_input']['source']['cluster_counts'][0].shape[0]
+        dynamic_max_len = int(cfg.generation.max_len_a * src_tokens + cfg.generation.max_len_b)
+        if cfg.generation.max_len > 0:
+            dynamic_max_len = min(dynamic_max_len, cfg.generation.max_len)
+
+        # Tighter max_len cap for small GPUs (keeps beam=20 feasible within 12GB)
+        if small_gpu and dynamic_max_len > 512:
+            dynamic_max_len = 512
+
         best_hypo = model.generate(target_list=sample["target"],
                                    num_beams=cfg.generation.beam,
-                                   max_length=cfg.generation.max_len,
+                                   max_length=dynamic_max_len,
                                    length_penalty=cfg.generation.lenpen,
+                                   no_repeat_ngram_size=cfg.generation.no_repeat_ngram_size,
+                                   repetition_penalty=cfg.generation.repetition_penalty,
                                    **sample["net_input"])
         best_hypo = tokenizer.batch_decode(
                 best_hypo, skip_special_tokens=True, clean_up_tokenization_spaces=False
@@ -235,6 +256,14 @@ def _main(cfg, output_file):
             result_dict['instruction'].append(instruction)
             result_dict['hypo'].append(hypo_str)
             logger.info(f"\nINST:{instruction}\nREF:{ref_sent}\nHYP:{hypo_str}\n")
+
+        # Free GPU memory between samples (prevents accumulation on 12GB GPUs)
+        if use_cuda:
+            torch.cuda.empty_cache()
+            free_mem = torch.cuda.mem_get_info()[0]
+            if free_mem < 2 * 1024**3:  # Less than 2 GB free
+                gc.collect()
+                torch.cuda.empty_cache()
 
     yaml_str = OmegaConf.to_yaml(cfg.generation)
     fid = int(hashlib.md5(yaml_str.encode("utf-8")).hexdigest(), 16)

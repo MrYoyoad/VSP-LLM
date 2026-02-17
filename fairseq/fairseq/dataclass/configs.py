@@ -797,6 +797,12 @@ class GenerationConfig(FairseqDataclass):
             "help": "ngram blocking such that this size ngram cannot be repeated in the generation"
         },
     )
+    repetition_penalty: float = field(
+        default=1.0,
+        metadata={
+            "help": "repetition penalty (CTRL paper, Keskar 2019). 1.0=disabled, >1.0 penalizes repeated tokens"
+        },
+    )
     sampling: bool = field(
         default=False,
         metadata={"help": "sample hypotheses instead of using beam search"},
