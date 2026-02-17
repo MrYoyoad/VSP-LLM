@@ -134,6 +134,60 @@ def _loads_json_or_py(text: str) -> Any:
     except Exception:
         return ast.literal_eval(text)
 
+def parse_segment_id(segment_id: str) -> Tuple[str, int, int, int]:
+    """
+    Parse segment ID to extract components.
+    Format: {video_id}_{seg_idx:02d}_{start_frame:06d}_{end_frame:06d}
+
+    Returns: (base_video_id, seg_idx, start_frame, end_frame)
+    For non-segmented IDs, returns (segment_id, -1, -1, -1).
+    """
+    parts = segment_id.split('_')
+
+    if len(parts) < 4:
+        return segment_id, -1, -1, -1
+
+    try:
+        end_frame = int(parts[-1])
+        start_frame = int(parts[-2])
+        seg_idx = int(parts[-3])
+        base_video_id = '_'.join(parts[:-3])
+        return base_video_id, seg_idx, start_frame, end_frame
+    except (ValueError, IndexError):
+        return segment_id, -1, -1, -1
+
+
+def build_display_names(recs: List[Rec]) -> Dict[str, str]:
+    """
+    Build user-friendly display names for segment IDs.
+
+    Single-segment videos  -> just base name (e.g., "Obama")
+    Multi-segment videos   -> "Obama - Part 1", "Obama - Part 2", etc.
+    Non-segmented IDs      -> returned as-is (e.g., "00008")
+    """
+    # Group records by base video ID
+    groups: Dict[str, List[Tuple[int, str]]] = {}
+    for r in recs:
+        base, seg_idx, _, _ = parse_segment_id(r.utt_id)
+        if base not in groups:
+            groups[base] = []
+        groups[base].append((seg_idx, r.utt_id))
+
+    names: Dict[str, str] = {}
+    for base, entries in groups.items():
+        if len(entries) == 1:
+            # Single segment (or non-segmented) -> just base name
+            _, utt_id = entries[0]
+            names[utt_id] = base
+        else:
+            # Multi-segment -> sort by seg_idx and assign Part numbers
+            entries.sort(key=lambda x: x[0])
+            for part_num, (_, utt_id) in enumerate(entries, 1):
+                names[utt_id] = f"{base} - Part {part_num}"
+
+    return names
+
+
 def load_records(path: Path) -> List[Rec]:
     """
     Returns list of records:
@@ -250,6 +304,10 @@ def main() -> None:
         print(f"[WARN] No records loaded from {args.jsonl}")
         return
 
+    # Build display names and sort by (base_video_id, segment_index)
+    display_names = build_display_names(recs)
+    recs.sort(key=lambda r: (parse_segment_id(r.utt_id)[0], parse_segment_id(r.utt_id)[1]))
+
     # Build outputs
     rows_csv = []
     html_rows = []
@@ -260,18 +318,20 @@ def main() -> None:
         ref = r.ref or ""
         hyp = r.hypo or ""
         tagged = align(ref, hyp)
+        dname = display_names.get(r.utt_id, r.utt_id)
 
-        rows_csv.append((r.utt_id, ref, hyp, " ".join([f"{w}:{t}" for w, t in tagged])))
+        rows_csv.append((r.utt_id, dname, ref, hyp, " ".join([f"{w}:{t}" for w, t in tagged])))
 
         html_rows.append(
-            f"<tr><td><b>{escape(r.utt_id)}</b></td>"
+            f"<tr><td><b>{escape(dname)}</b><br>"
+            f"<small>{escape(r.utt_id)}</small></td>"
             f"<td><pre>{escape(ref)}</pre></td>"
             f"<td><pre>{hyp_html(tagged)}</pre></td></tr>"
         )
 
         # Plain text block
         txt_blocks.append(
-            f"{r.utt_id}\n"
+            f"{dname}\n"
             f"REF: {ref if ref.strip() else '(no ref available)'}\n"
             f"HYP: {hyp if hyp.strip() else '(no hyp available)'}\n"
             f"{block_sep()}"
@@ -279,7 +339,7 @@ def main() -> None:
 
         # ANSI block (colored hypothesis)
         ansi_blocks.append(
-            f"{r.utt_id}\n"
+            f"{dname}\n"
             f"{ANSI['dim']}REF:{ANSI['reset']} {ref if ref.strip() else '(no ref available)'}\n"
             f"{ANSI['dim']}HYP:{ANSI['reset']} {hyp_ansi(tagged) if hyp.strip() else '(no hyp available)'}\n"
             f"{ANSI['dim']}{block_sep()}{ANSI['reset']}"
@@ -288,7 +348,7 @@ def main() -> None:
     # Write CSV
     with open(out_dir / "report.csv", "w", newline="", encoding="utf-8") as cf:
         w = csv.writer(cf)
-        w.writerow(["utt_id", "ref", "hyp", "hyp_tagged"])
+        w.writerow(["utt_id", "display_name", "ref", "hyp", "hyp_tagged"])
         w.writerows(rows_csv)
 
     # Write HTML

@@ -305,6 +305,25 @@ def main() -> None:
         print(f"[WARN] No records loaded from {args.jsonl}")
         return
 
+    # Build display names for Part naming in output filenames
+    # Group by base video ID to determine single vs multi-segment
+    _groups: Dict[str, List[Tuple[int, str]]] = {}
+    for uid in hyps:
+        base, seg_idx, _, _ = parse_segment_id(uid)
+        if base not in _groups:
+            _groups[base] = []
+        _groups[base].append((seg_idx, uid))
+
+    _file_names: Dict[str, str] = {}
+    for base, entries in _groups.items():
+        if len(entries) == 1:
+            _, uid = entries[0]
+            _file_names[uid] = f"{base}_with_hyp.mp4"
+        else:
+            entries.sort(key=lambda x: x[0])
+            for part_num, (_, uid) in enumerate(entries, 1):
+                _file_names[uid] = f"{base}_Part{part_num}_with_hyp.mp4"
+
     for uid, hyp in hyps.items():
         src = None
         temp_extracted = None
@@ -429,7 +448,7 @@ def main() -> None:
         box_h = max(int(needed), min(args.box_h, int(h * 0.45)))
         box_h = min(box_h, h - 2)
 
-        dst = out_dir / f"{uid}_with_hyp.mp4"
+        dst = out_dir / _file_names.get(uid, f"{uid}_with_hyp.mp4")
 
         tf = tempfile.NamedTemporaryFile("w", encoding="utf-8", suffix=".txt", delete=False)
         try:
