@@ -10,7 +10,31 @@ from dataclasses import dataclass
 from difflib import SequenceMatcher
 from html import escape
 from pathlib import Path
-from typing import Any, Dict, List, Tuple
+from typing import Any, Dict, List, Optional, Tuple
+import editdistance
+
+# -----------------------
+# spaCy (optional, graceful fallback)
+# -----------------------
+
+try:
+    import spacy
+    _nlp = spacy.load('en_core_web_sm')
+    HAS_SPACY = True
+except (ImportError, OSError):
+    HAS_SPACY = False
+
+# Basic stopword list used as fallback when spaCy is not available
+_STOPWORDS = frozenset(
+    "a an the and or but if in on at to for of is am are was were be been being "
+    "have has had do does did will would shall should may might can could "
+    "i me my we us our you your he him his she her it its they them their "
+    "that this these those who whom which what where when how not no nor "
+    "so very too also just than more most such as with from by about between "
+    "into through during before after above below up down out off over under "
+    "again then once here there all each every both few many much some any "
+    "other another same different new old".split()
+)
 
 
 # -----------------------
@@ -72,15 +96,17 @@ table{border-collapse:collapse; width:100%}
 td,th{border:1px solid #ddd; padding:10px; vertical-align:top}
 th{background:#f5f5f5; text-align:left}
 .ok{color:#0a7a0a; font-weight:700}
-.rep{color:#b58900; font-weight:800} /* yellow-ish */
+.rep{color:#b58900; font-weight:800}
 .ins{color:#b00020; font-weight:800}
+.nea-green{background:#d4edda; color:#155724; font-weight:700; text-align:center}
+.nea-yellow{background:#fff3cd; color:#856404; font-weight:700; text-align:center}
+.nea-red{background:#f8d7da; color:#721c24; font-weight:700; text-align:center}
 small{color:#555}
 pre{white-space:pre-wrap; word-break:break-word; margin:0}
+.summary{background:#e9ecef; padding:12px; border-radius:6px; margin-bottom:16px}
 </style></head><body>
 <h2>ASR Report (REF vs HYP)</h2>
 <p><span class="ok">green</span>=match, <span class="rep">yellow</span>=mismatch/shift, <span class="ins">red</span>=inserted/made-up</p>
-<table>
-<tr><th>ID</th><th>Reference</th><th>Hypothesis (colored)</th></tr>
 """
 
 HTML_TAIL = "</table></body></html>"
@@ -112,6 +138,191 @@ def safe_one_line(s: str) -> str:
     s = (s or "").replace("\n", " ").strip()
     s = re.sub(r"\s+", " ", s)
     return s
+
+
+# -----------------------
+# Semantic metrics (NEA + Weighted WER)
+# -----------------------
+
+# Token value categories for weighted metrics
+_HIGH_POS = {"PROPN", "NUM"}         # proper nouns, numbers
+_HIGH_ENT = {"PERSON", "ORG", "GPE", "LOC", "MONEY", "DATE", "TIME", "PERCENT", "QUANTITY", "NORP", "FAC", "EVENT"}
+_MED_POS  = {"NOUN", "VERB", "ADJ", "ADV"}  # content words
+# Everything else (DET, AUX, PRON, ADP, CONJ, PUNCT, etc.) = low value
+
+_WEIGHT_HIGH = 2.0
+_WEIGHT_MED  = 1.0
+_WEIGHT_LOW  = 0.5
+
+
+def _classify_token_spacy(token) -> str:
+    """Classify a spaCy token as 'high', 'med', or 'low' value."""
+    if token.ent_type_ in _HIGH_ENT or token.pos_ in _HIGH_POS:
+        return "high"
+    if token.pos_ in _MED_POS:
+        return "med"
+    return "low"
+
+
+def _classify_token_basic(word: str) -> str:
+    """Classify a word without spaCy (stopword-based fallback)."""
+    w = word.lower().strip()
+    if not w:
+        return "low"
+    # Numbers and words starting with uppercase-like patterns → high
+    if w.isdigit() or re.match(r'^[0-9]', w):
+        return "high"
+    if w in _STOPWORDS:
+        return "low"
+    return "med"
+
+
+def classify_tokens(text: str) -> List[Tuple[str, str]]:
+    """
+    Classify each token in text as 'high', 'med', or 'low' value.
+    Returns: [(word, category), ...]
+
+    With spaCy: Uses POS tags + NER for classification.
+    Without spaCy: Uses stopword filtering (basic but functional).
+    """
+    words = toks(text)
+    if not words:
+        return []
+
+    if HAS_SPACY:
+        doc = _nlp(text.lower())
+        result = []
+        for token in doc:
+            w = re.sub(r'[^a-z0-9\']', '', token.text.lower())
+            if not w:
+                continue
+            result.append((w, _classify_token_spacy(token)))
+        return result
+    else:
+        return [(w, _classify_token_basic(w)) for w in words]
+
+
+def _weight_for(cat: str) -> float:
+    if cat == "high":
+        return _WEIGHT_HIGH
+    if cat == "med":
+        return _WEIGHT_MED
+    return _WEIGHT_LOW
+
+
+@dataclass
+class MetricsResult:
+    wwer: float               # Weighted WER (%)
+    nea_recall: float         # NEA recall (%)
+    nea_precision: float      # NEA precision (%)
+    nea_f1: float             # NEA F1 (%)
+    missed_entities: List[str]  # High-value ref tokens not found in hyp
+    mode: str                 # "spaCy POS/NER" or "basic stopword filter"
+
+
+def nea_metrics(ref: str, hyp: str) -> MetricsResult:
+    """
+    Compute Named Entity Accuracy (NEA) metrics.
+
+    NEA focuses on high-value tokens (proper nouns, numbers, named entities).
+    - Recall: how many important ref words appear in hyp
+    - Precision: how much of hyp's important content is real
+    - F1: harmonic mean
+    """
+    ref_classified = classify_tokens(ref)
+    hyp_classified = classify_tokens(hyp)
+
+    ref_high = [w for w, c in ref_classified if c == "high"]
+    hyp_high = [w for w, c in hyp_classified if c == "high"]
+
+    if not ref_high and not hyp_high:
+        return MetricsResult(0.0, 100.0, 100.0, 100.0, [], _metrics_mode())
+
+    ref_high_set = set(ref_high)
+    hyp_high_set = set(hyp_high)
+
+    matched = ref_high_set & hyp_high_set
+    missed = sorted(ref_high_set - hyp_high_set)
+
+    recall = (len(matched) / len(ref_high_set) * 100) if ref_high_set else 100.0
+    precision = (len(matched) / len(hyp_high_set) * 100) if hyp_high_set else 100.0
+    f1 = (2 * recall * precision / (recall + precision)) if (recall + precision) > 0 else 0.0
+
+    return MetricsResult(0.0, recall, precision, f1, missed, _metrics_mode())
+
+
+def weighted_wer(ref: str, hyp: str) -> float:
+    """
+    Compute Weighted WER where errors on high-value tokens cost more.
+
+    Uses editdistance-style alignment but weights errors by token category:
+    - High-value (PROPN, NUM, entities): 2.0x
+    - Medium (NOUN, VERB, ADJ, ADV): 1.0x
+    - Low (function words): 0.5x
+    """
+    ref_tokens = classify_tokens(ref)
+    hyp_words = toks(hyp)
+
+    if not ref_tokens:
+        return 0.0
+
+    ref_words = [w for w, _ in ref_tokens]
+    ref_cats = {i: c for i, (_, c) in enumerate(ref_tokens)}
+
+    # Use SequenceMatcher for alignment
+    sm = SequenceMatcher(None, ref_words, hyp_words)
+    weighted_errors = 0.0
+    weighted_total = 0.0
+
+    # Total weighted reference length
+    for i, (_, cat) in enumerate(ref_tokens):
+        weighted_total += _weight_for(cat)
+
+    # Count weighted errors from alignment opcodes
+    for op, i1, i2, j1, j2 in sm.get_opcodes():
+        if op == 'equal':
+            continue
+        elif op == 'replace':
+            for i in range(i1, i2):
+                weighted_errors += _weight_for(ref_cats.get(i, "med"))
+        elif op == 'delete':
+            for i in range(i1, i2):
+                weighted_errors += _weight_for(ref_cats.get(i, "med"))
+        elif op == 'insert':
+            # Insertions: use medium weight (no ref token to categorize)
+            weighted_errors += (j2 - j1) * _WEIGHT_MED
+
+    if weighted_total == 0:
+        return 0.0
+    return weighted_errors / weighted_total * 100
+
+
+def _metrics_mode() -> str:
+    return "spaCy POS/NER" if HAS_SPACY else "basic stopword filter"
+
+
+def compute_all_metrics(ref: str, hyp: str) -> MetricsResult:
+    """Compute NEA + Weighted WER for a single ref/hyp pair."""
+    nea = nea_metrics(ref, hyp)
+    wwer = weighted_wer(ref, hyp)
+    nea.wwer = wwer
+    return nea
+
+
+def nea_color(nea_recall: float, wer: float) -> str:
+    """
+    Data-driven coloring: compare NEA recall to word accuracy.
+    Green: entities preserved at least as well as average words.
+    Yellow: slight entity loss (within 10 points).
+    Red: disproportionate entity loss (>10 points below word accuracy).
+    """
+    word_accuracy = max(0.0, 100.0 - wer)
+    if nea_recall >= word_accuracy:
+        return "green"
+    elif nea_recall >= word_accuracy - 10:
+        return "yellow"
+    else:
+        return "red"
 
 
 # -----------------------
@@ -308,11 +519,20 @@ def main() -> None:
     display_names = build_display_names(recs)
     recs.sort(key=lambda r: (parse_segment_id(r.utt_id)[0], parse_segment_id(r.utt_id)[1]))
 
-    # Build outputs
+    print(f"[INFO] Metrics mode: {_metrics_mode()}")
+
+    # Build outputs with metrics
     rows_csv = []
     html_rows = []
     txt_blocks = []
     ansi_blocks = []
+
+    # Accumulators for overall summary
+    total_wwer_num = 0.0
+    total_wwer_den = 0.0
+    total_nea_recall = 0.0
+    total_nea_f1 = 0.0
+    n_with_ref = 0
 
     for r in recs:
         ref = r.ref or ""
@@ -320,55 +540,143 @@ def main() -> None:
         tagged = align(ref, hyp)
         dname = display_names.get(r.utt_id, r.utt_id)
 
-        rows_csv.append((r.utt_id, dname, ref, hyp, " ".join([f"{w}:{t}" for w, t in tagged])))
+        # Compute metrics (only meaningful when ref is available)
+        has_ref = bool(ref.strip())
+        if has_ref:
+            m = compute_all_metrics(ref, hyp)
+            # Compute simple WER for color comparison
+            r_toks = toks(ref)
+            h_toks = toks(hyp)
+            simple_wer = (editdistance.eval(h_toks, r_toks) / len(r_toks) * 100) if r_toks else 0.0
+            color = nea_color(m.nea_recall, simple_wer)
+
+            total_wwer_num += m.wwer
+            total_nea_recall += m.nea_recall
+            total_nea_f1 += m.nea_f1
+            n_with_ref += 1
+        else:
+            m = None
+            simple_wer = 0.0
+            color = "green"
+
+        # CSV row
+        if m:
+            rows_csv.append((
+                r.utt_id, dname, ref, hyp,
+                " ".join([f"{w}:{t}" for w, t in tagged]),
+                f"{m.wwer:.1f}", f"{m.nea_recall:.1f}", f"{m.nea_precision:.1f}",
+                f"{m.nea_f1:.1f}", ", ".join(m.missed_entities) if m.missed_entities else ""
+            ))
+        else:
+            rows_csv.append((
+                r.utt_id, dname, ref, hyp,
+                " ".join([f"{w}:{t}" for w, t in tagged]),
+                "", "", "", "", ""
+            ))
+
+        # HTML row
+        nea_cell = ""
+        if m:
+            css = f"nea-{color}"
+            missed_tip = f' title="Missed: {escape(", ".join(m.missed_entities))}"' if m.missed_entities else ""
+            nea_cell = (
+                f'<td class="{css}"{missed_tip}>'
+                f'{m.nea_recall:.0f}%</td>'
+                f'<td style="text-align:center">{m.wwer:.1f}%</td>'
+            )
+        else:
+            nea_cell = '<td>-</td><td>-</td>'
 
         html_rows.append(
             f"<tr><td><b>{escape(dname)}</b><br>"
             f"<small>{escape(r.utt_id)}</small></td>"
             f"<td><pre>{escape(ref)}</pre></td>"
-            f"<td><pre>{hyp_html(tagged)}</pre></td></tr>"
+            f"<td><pre>{hyp_html(tagged)}</pre></td>"
+            f"{nea_cell}</tr>"
         )
 
         # Plain text block
+        metrics_line = ""
+        if m:
+            metrics_line = f"WWER: {m.wwer:.1f}% | NEA: R={m.nea_recall:.0f}% P={m.nea_precision:.0f}% F1={m.nea_f1:.0f}%"
+            if m.missed_entities:
+                metrics_line += f" | Missed: [{', '.join(m.missed_entities)}]"
+            metrics_line = f"\n{metrics_line}"
+
         txt_blocks.append(
             f"{dname}\n"
             f"REF: {ref if ref.strip() else '(no ref available)'}\n"
-            f"HYP: {hyp if hyp.strip() else '(no hyp available)'}\n"
+            f"HYP: {hyp if hyp.strip() else '(no hyp available)'}"
+            f"{metrics_line}\n"
             f"{block_sep()}"
         )
 
-        # ANSI block (colored hypothesis)
+        # ANSI block
+        ansi_metrics = ""
+        if m:
+            c = {"green": ANSI["ok"], "yellow": ANSI["rep"], "red": ANSI["ins"]}
+            ansi_metrics = (
+                f"\n{ANSI['dim']}WWER:{ANSI['reset']} {m.wwer:.1f}% | "
+                f"{c.get(color, '')}"
+                f"NEA: R={m.nea_recall:.0f}% P={m.nea_precision:.0f}% F1={m.nea_f1:.0f}%"
+                f"{ANSI['reset']}"
+            )
+            if m.missed_entities:
+                ansi_metrics += f" | {ANSI['ins']}Missed: [{', '.join(m.missed_entities)}]{ANSI['reset']}"
+
         ansi_blocks.append(
             f"{dname}\n"
             f"{ANSI['dim']}REF:{ANSI['reset']} {ref if ref.strip() else '(no ref available)'}\n"
-            f"{ANSI['dim']}HYP:{ANSI['reset']} {hyp_ansi(tagged) if hyp.strip() else '(no hyp available)'}\n"
+            f"{ANSI['dim']}HYP:{ANSI['reset']} {hyp_ansi(tagged) if hyp.strip() else '(no hyp available)'}"
+            f"{ansi_metrics}\n"
             f"{ANSI['dim']}{block_sep()}{ANSI['reset']}"
         )
+
+    # Overall summary
+    if n_with_ref > 0:
+        avg_wwer = total_wwer_num / n_with_ref
+        avg_nea_recall = total_nea_recall / n_with_ref
+        avg_nea_f1 = total_nea_f1 / n_with_ref
+        summary = f"OVERALL | WWER: {avg_wwer:.1f}% | NEA Recall: {avg_nea_recall:.0f}% | NEA F1: {avg_nea_f1:.0f}% | Mode: {_metrics_mode()} | Segments: {n_with_ref}"
+    else:
+        summary = "OVERALL | No reference transcriptions available for metrics"
 
     # Write CSV
     with open(out_dir / "report.csv", "w", newline="", encoding="utf-8") as cf:
         w = csv.writer(cf)
-        w.writerow(["utt_id", "display_name", "ref", "hyp", "hyp_tagged"])
+        w.writerow(["utt_id", "display_name", "ref", "hyp", "hyp_tagged",
+                     "wwer_%", "nea_recall_%", "nea_precision_%", "nea_f1_%", "missed_entities"])
         w.writerows(rows_csv)
 
     # Write HTML
+    html_summary = f'<div class="summary"><b>{escape(summary)}</b></div>'
+    html_table = (
+        '<table>\n'
+        '<tr><th>ID</th><th>Reference</th><th>Hypothesis (colored)</th>'
+        '<th>NEA Recall</th><th>WWER</th></tr>\n'
+        + "\n".join(html_rows)
+    )
     (out_dir / "report.html").write_text(
-        HTML_HEAD + "\n".join(html_rows) + HTML_TAIL,
+        HTML_HEAD + html_summary + html_table + HTML_TAIL,
         encoding="utf-8"
     )
 
     # Write plain txt
     (out_dir / "report.txt").write_text(
-        "\n".join(txt_blocks) + "\n(END)\n",
+        summary + "\n" + block_sep() + "\n"
+        + "\n".join(txt_blocks) + "\n(END)\n",
         encoding="utf-8"
     )
 
     # Write ANSI txt
+    ansi_summary = f"{ANSI['ok']}{summary}{ANSI['reset']}"
     (out_dir / "report.ansi.txt").write_text(
-        "\n".join(ansi_blocks) + f"\n{ANSI['dim']}(END){ANSI['reset']}\n",
+        ansi_summary + "\n" + f"{ANSI['dim']}{block_sep()}{ANSI['reset']}\n"
+        + "\n".join(ansi_blocks) + f"\n{ANSI['dim']}(END){ANSI['reset']}\n",
         encoding="utf-8"
     )
 
+    print(summary)
     print("Wrote:", out_dir / "report.csv")
     print("Wrote:", out_dir / "report.html")
     print("Wrote:", out_dir / "report.ansi.txt")
