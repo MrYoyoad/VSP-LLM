@@ -5,7 +5,9 @@
 # This source code is licensed under the license found in the
 # LICENSE file in the root directory of this source tree.
 
-LANG=en    # language direction (e.g 'en' for VSR task / 'en-es' for En to Es VST task)
+LANG=en
+# NEW: export language for Python side
+export VSP_LANG="${LANG}"
 
 # set paths
 ROOT=$(dirname "$(dirname "$(readlink -fm "$0")")")
@@ -13,8 +15,8 @@ MODEL_SRC=${ROOT}/src
 LLM_PATH=${ROOT}/checkpoints/Llama-2-7b-hf   # path to llama checkpoint
 DATA_ROOT=${MODEL_SRC}/dataset   # path to test dataset dir
 
-MODEL_PATH=${ROOT}/checkpoints/checkpoint_finetune.pt  # path to trained model
-OUT_PATH=${ROOT}/decode    # output path to save
+MODEL_PATH=/home/ubuntu/VSP-LLM/checkpoints/checkpoint_finetune.pt
+OUT_PATH=/home/ubuntu/VSP-LLM/decode/vsr/en
 
 # fix variables based on langauge
 if [[ $LANG == *"-"* ]] ; then
@@ -32,7 +34,8 @@ fi
 
 # start decoding
 export PYTHONPATH="${ROOT}/fairseq:$PYTHONPATH"
-CUDA_VISIBLE_DEVICES=0 python -B ${MODEL_SRC}/vsp_llm_decode.py \
+export PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True
+CUDA_VISIBLE_DEVICES=0 python3 -B ${MODEL_SRC}/vsp_llm_decode.py \
     --config-dir ${MODEL_SRC}/conf \
     --config-name s2s_decode \
         common.user_dir=${MODEL_SRC} \
@@ -45,4 +48,4 @@ CUDA_VISIBLE_DEVICES=0 python -B ${MODEL_SRC}/vsp_llm_decode.py \
         override.eval_bleu=${USE_BLEU} \
         override.llm_ckpt_path=${LLM_PATH} \
         common_eval.path=${MODEL_PATH} \
-        common_eval.results_path=${OUT_PATH}/${TASK}/${LANG}
+        common_eval.results_path=${OUT_PATH}

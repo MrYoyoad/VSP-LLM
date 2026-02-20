@@ -52,7 +52,7 @@ mkdir -p "${FEAT_DIR}" "${LAB_DIR}"
 # ---------- Step 1: dump HuBERT features ----------
 
 echo ">>> [Step 1] Dumping HuBERT features for split: ${SPLIT}"
-python "${ROOT}/src/clustering/dump_hubert_feature.py" \
+python3 "${ROOT}/src/clustering/dump_hubert_feature.py" \
     "${TSV_ROOT}" \
     "${SPLIT}" \
     "${CKPT}" \
@@ -78,7 +78,7 @@ if [[ -n "${GOLDEN_KMEANS:-}" ]]; then
 elif [[ "${TRAIN_KMEANS}" == "1" ]]; then
   echo
   echo ">>> [Step 2] Learning k-means (200 clusters) on ${PERCENT} of data for split: ${SPLIT}"
-  python "${ROOT}/src/clustering/learn_kmeans.py" \
+  python3 "${ROOT}/src/clustering/learn_kmeans.py" \
       "${FEAT_DIR}" \
       "${SPLIT}" \
       "${NSHARD}" \
@@ -100,7 +100,7 @@ fi
 
 echo
 echo ">>> [Step 3] Dumping k-means labels for ${SPLIT}"
-python "${ROOT}/src/clustering/dump_km_label.py" \
+python3 "${ROOT}/src/clustering/dump_km_label.py" \
     "${FEAT_DIR}" \
     "${SPLIT}" \
     "${KM_PATH}" \

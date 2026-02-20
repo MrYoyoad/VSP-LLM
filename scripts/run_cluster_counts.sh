@@ -51,7 +51,7 @@ mkdir -p "$(dirname "${OUT_PTH}")"
 # Patch cluster_counts.py (unit_pth / out_pth)
 ########################################
 
-python - << EOF
+python3 - << EOF
 from pathlib import Path
 import re
 
@@ -82,8 +82,8 @@ EOF
 ########################################
 
 echo
-echo ">>> Running: python ${CC_PY}"
-python "${CC_PY}"
+echo ">>> Running: python3 ${CC_PY}"
+python3 "${CC_PY}"
 
 echo
 echo ">>> Done. Wrote: ${OUT_PTH}"
