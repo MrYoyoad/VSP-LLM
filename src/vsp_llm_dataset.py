@@ -23,7 +23,7 @@ from transformers import AutoTokenizer, AutoModelForSeq2SeqLM
 DBG=True if len(sys.argv) == 1 else False
 
 if DBG:
-    import utils as custom_utils
+    from . import utils_vsp_llm as custom_utils
     logging.basicConfig(
         format="%(asctime)s | %(levelname)s | %(name)s | %(message)s",
         datefmt="%Y-%m-%d %H:%M:%S",
@@ -342,24 +342,84 @@ class VSP_LLM_dataset(FairseqDataset):
         return mixed
 
 
+
+
     def __getitem__(self, index):
         video_feats, audio_feats = self.load_feature(self.names[index])
-        audio_feats, video_feats = torch.from_numpy(audio_feats.astype(np.float32)) if audio_feats is not None else None, torch.from_numpy(video_feats.astype(np.float32)) if video_feats is not None else None
-        if self.normalize and 'audio' in self.modalities:
+
+        audio_feats = (
+            torch.from_numpy(audio_feats.astype(np.float32))
+            if audio_feats is not None
+            else None
+        )
+        video_feats = (
+            torch.from_numpy(video_feats.astype(np.float32))
+            if video_feats is not None
+            else None
+        )
+
+        if self.normalize and 'audio' in self.modalities and audio_feats is not None:
             with torch.no_grad():
                 audio_feats = F.layer_norm(audio_feats, audio_feats.shape[1:])
+
         cluster_counts = self.load_units(index)
-        labels = [self.llm_tokenizer(self.label_list[0][index], return_tensors="pt").input_ids[0]]
+
+        # ground-truth text tokens
+        labels = [
+            self.llm_tokenizer(
+                self.label_list[0][index],
+                return_tensors="pt",
+            ).input_ids[0]
+        ]
         labels = [torch.cat((labels[0], torch.tensor([2]).long()))]
-        
+
+        # ----- figure out language direction from fid -----
         fid = self.names[index][1].split(':')[1]
-        src_lang, tgt_lang = fid.split('/')[1].split('-')
-        if src_lang == tgt_lang:
-            txt_feats = self.llm_tokenizer(f"Recognize this speech in {self.lang_dict[src_lang]}. Input : ", return_tensors="pt").input_ids[0]
+        parts = fid.split('/')
+
+        if len(parts) > 1 and '-' in parts[1]:
+            # Muavic-style: .../en-es/...
+            src_lang, tgt_lang = parts[1].split('-')
         else:
-            txt_feats = self.llm_tokenizer(f"Translate this {self.lang_dict[src_lang]} speech to {self.lang_dict[tgt_lang]}. Input : ", return_tensors="pt").input_ids[0]
-        
-        return {"id": index, 'fid': fid, "video_source": video_feats, 'audio_source': audio_feats, "cluster_counts": cluster_counts, "label_list": labels, 'text_source':[txt_feats]}
+            # Flat 433h VSR IDs – same language, taken from env
+            lang_code = os.environ.get("VSP_LANG", "en")
+            src_lang = tgt_lang = lang_code
+
+        # ----- build instruction -----
+        if src_lang == tgt_lang:
+            # recognition in a single language (VSR)
+            lang_code = os.environ.get("VSP_LANG", "en")
+            lang_name_map = {
+                "en": "English",
+                "ar": "Arabic",
+                "es": "Spanish",
+                "fr": "French",
+                "it": "Italian",
+                "pt": "Portuguese",
+            }
+            lang_name = lang_name_map.get(lang_code, lang_code)
+            instruction = f"Recognize this speech in {lang_name}. Input : "
+        else:
+            # translation (VST)
+            instruction = (
+                f"Translate this {self.lang_dict[src_lang]} speech to "
+                f"{self.lang_dict[tgt_lang]}. Input : "
+            )
+
+        txt_feats = self.llm_tokenizer(
+            instruction,
+            return_tensors="pt",
+        ).input_ids[0]
+
+        return {
+            "id": index,
+            "fid": fid,
+            "video_source": video_feats,
+            "audio_source": audio_feats,
+            "cluster_counts": cluster_counts,
+            "label_list": labels,
+            "text_source": [txt_feats],
+        }
 
     def __len__(self):
         return len(self.sizes)

@@ -294,8 +294,8 @@ class avhubert_llm_seq2seq_cluster_count(BaseFairseqModel):
         decoder_4bit = AutoModelForCausalLM.from_pretrained(cfg.llm_ckpt_path, quantization_config=bnb_config)            
 
         config = LoraConfig(
-            r=16, 
-            lora_alpha=32, 
+            r=64,
+            lora_alpha=128,
             target_modules=["q_proj", "v_proj", "k_proj"], 
             lora_dropout=0.05, 
             bias="none", 
@@ -355,6 +355,9 @@ class avhubert_llm_seq2seq_cluster_count(BaseFairseqModel):
                 top_p=0.9,
                 repetition_penalty=1.0,
                 length_penalty=0.0,
+                no_repeat_ngram_size=0,
+                do_sample=False,
+                temperature=1.0,
                   **kwargs,
                 ):
         output = self.encoder(**kwargs)
@@ -386,8 +389,10 @@ class avhubert_llm_seq2seq_cluster_count(BaseFairseqModel):
                         max_new_tokens=max_length,
                         min_length=min_length,
                         repetition_penalty=repetition_penalty,
-                        do_sample=True,
+                        do_sample=do_sample,
+                        temperature=temperature,
                         length_penalty=length_penalty,
+                        no_repeat_ngram_size=no_repeat_ngram_size,
                         )
 
         return outputs
@@ -413,6 +418,18 @@ class avhubert_llm_seq2seq_cluster_count(BaseFairseqModel):
         """Set the number of parameters updates."""
         super().set_num_updates(num_updates)
         self.num_updates = num_updates
+
+    def load_state_dict(self, state_dict, strict=True, model_cfg=None, args=None):
+        # Use strict=False because state_dict() only saves encoder + LoRA + avfeat_to_llm.
+        # Base LLM weights are loaded from HuggingFace in build_model().
+        # Also filter out keys with shape mismatches (e.g., LoRA rank changed).
+        current_state = {k: v for k, v in self.state_dict().items()}
+        filtered = {}
+        for k, v in state_dict.items():
+            if k in current_state and current_state[k].shape != v.shape:
+                continue  # skip shape-mismatched keys (e.g., r=16 -> r=64)
+            filtered[k] = v
+        return super().load_state_dict(filtered, strict=False, model_cfg=model_cfg, args=args)
 
     def state_dict(self):
         old_state = super().state_dict()

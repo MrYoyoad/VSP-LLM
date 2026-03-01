@@ -10,6 +10,9 @@ generation:
   max_len: 2048           # Hard cap on dynamic_max_len (0 = use model default)
   no_repeat_ngram_size: 3 # Prevent degenerate n-gram repetitions
   repetition_penalty: 1.2 # Mild penalty for repeating tokens (CTRL paper, Keskar 2019). 1.0=off, range 1.1-1.5
+  do_sample: false         # false = pure beam search (deterministic), true = stochastic sampling
+  temperature: 1.0         # Sampling temperature (lower = sharper). Only used when do_sample=true
+  top_p: 0.9               # Nucleus sampling threshold. Only used when do_sample=true
   lm_weight: 0
 
 common_eval:

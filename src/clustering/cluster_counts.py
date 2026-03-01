@@ -1,5 +1,5 @@
 
-unit_pth = ???
+unit_pth = '/home/ubuntu/VSP-LLM/flat_labels/train.km'
 units = open(unit_pth).readlines()
 count_list = []
 for unit_line in units:

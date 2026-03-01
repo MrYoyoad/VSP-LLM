@@ -24,8 +24,8 @@ from argparse import Namespace
 DBG=True if len(sys.argv) == 1 else False
 
 if DBG:
-    from hubert_dataset import AVHubertDataset
-    from sequence_generator import SequenceGenerator
+    from .hubert_dataset import AVHubertDataset
+    from .sequence_generator import SequenceGenerator
 else:
     from .hubert_dataset import AVHubertDataset
     from .sequence_generator import SequenceGenerator

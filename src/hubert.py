@@ -3,18 +3,19 @@
 #
 # This source code is licensed under the license found in the
 # LICENSE file in the root directory of this source tree.
-
-import os,sys
+import os
+import sys
 import logging
 from typing import Dict, List, Optional, Tuple
 
 import numpy as np
-
 import torch
 import torch.nn as nn
+
 from dataclasses import dataclass, field
+from copy import deepcopy
+
 from fairseq import utils
-from fairseq.data.data_utils import compute_mask_indices
 from fairseq.data.dictionary import Dictionary
 from fairseq.dataclass import ChoiceEnum, FairseqDataclass
 from fairseq.models import BaseFairseqModel, register_model
@@ -23,26 +24,28 @@ from fairseq.models.wav2vec.wav2vec2 import (
     TransformerEncoder,
 )
 from fairseq.modules import GradMultiply, LayerNorm
-from copy import deepcopy
 
-DBG=True if len(sys.argv) == 1 else False
+# Debug mode only when running this file directly (e.g., python hubert.py)
+DBG = __name__ == "__main__"
 
 if DBG:
+    # Standalone / dev mode — only used if you manually run this file
     from hubert_pretraining import (
         AVHubertPretrainingConfig,
         AVHubertPretrainingTask,
     )
     from resnet import ResEncoder
+    from utils_vsp_llm import compute_mask_indices
+    from decoder import TransformerDecoder
+
     logging.basicConfig(
         format="%(asctime)s | %(levelname)s | %(name)s | %(message)s",
         datefmt="%Y-%m-%d %H:%M:%S",
         level=os.environ.get("LOGLEVEL", "INFO").upper(),
         stream=sys.stdout,
     )
-    from utils import compute_mask_indices
-    from decoder import TransformerDecoder
-
 else:
+    # Normal package mode: imported via fairseq.utils.import_user_module
     from .hubert_pretraining import (
         AVHubertPretrainingConfig,
         AVHubertPretrainingTask,

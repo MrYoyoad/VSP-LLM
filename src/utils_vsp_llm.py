@@ -11,6 +11,15 @@ import numpy as np
 from typing import Dict, List, Optional, Tuple
 
 def load_video(path):
+    import os
+    # Resolve relative paths via LRS3_ROOT (our dataset root)
+    if not os.path.isabs(path):
+        root = os.environ.get("LRS3_ROOT")
+        if root:
+            candidate = os.path.join(root, path)
+            if os.path.exists(candidate):
+                path = candidate
+
     for i in range(3):
         try:
             cap = cv2.VideoCapture(path)
