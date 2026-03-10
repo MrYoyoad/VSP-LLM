@@ -15,11 +15,14 @@ import editdistance
 import sys
 
 # -----------------------
-# IS scoring (optional, EC2 only via --compute-is)
+# IS scoring (optional, via --compute-is)
 # -----------------------
 
 HAS_IS = False
 try:
+    # Try same-directory import first (works in container and EC2)
+    sys.path.insert(0, str(Path(__file__).resolve().parent))
+    # Also try docs path (EC2 development layout)
     sys.path.insert(0, str(Path(__file__).resolve().parent.parent.parent / "docs" / "_research-tools" / "generators"))
     from generate_intelligibility_scores import (
         compute_is, compute_phonetic_similarity, compute_length_ratio,
@@ -618,7 +621,7 @@ def main() -> None:
     ap.add_argument("--jsonl", required=True, help="decode outputs (.jsonl OR hypo-*.json)")
     ap.add_argument("--out_dir", required=True)
     ap.add_argument("--params", default=None, help="decode_params JSON file (optional)")
-    ap.add_argument("--compute-is", action="store_true", help="Compute Intelligibility Scores (EC2 only)")
+    ap.add_argument("--compute-is", action="store_true", help="Compute Intelligibility Scores")
     args = ap.parse_args()
 
     out_dir = Path(args.out_dir)
