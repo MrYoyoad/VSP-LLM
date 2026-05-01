@@ -218,6 +218,40 @@ def _main(cfg, output_file):
     wps_meter = TimeMeter()
     result_dict = {'utt_id': [], 'ref': [], 'hypo': [], 'instruction': []}
     model = models[0]
+
+    output_scores_enabled = os.environ.get("VSP_OUTPUT_SCORES", "0") == "1"
+    confidence_records = {}  # utt_id -> {seq_score, tokens: [{token, prob}]}
+
+    # Pre-compute the file id so partial flushes can write to the same files
+    # the final dump uses. fid is deterministic from cfg.generation, so this
+    # match is stable across the loop.
+    _yaml_str = OmegaConf.to_yaml(cfg.generation)
+    fid = int(hashlib.md5(_yaml_str.encode("utf-8")).hexdigest(), 16) % 1000000
+    results_path = cfg.common_eval.results_path
+    hypo_fn = f"{results_path}/hypo-{fid}.json"
+    confidence_fn = f"{results_path}/confidence-{fid}.json"
+
+    # Atomic, crash-resilient incremental flush. Writes the *current* in-memory
+    # dicts to a .tmp file, then os.replace into place — so a kill mid-write
+    # leaves either the prior good file or the new one, never corrupt JSON.
+    # Cadence is sample-count based; configurable via env so we can tune later.
+    flush_every = int(os.environ.get("VSP_FLUSH_EVERY", "25"))
+
+    def _flush_partial():
+        try:
+            tmp = f"{hypo_fn}.tmp"
+            with open(tmp, "w") as f:
+                json.dump(result_dict, f, indent=4)
+            os.replace(tmp, hypo_fn)
+            if output_scores_enabled and confidence_records:
+                tmp_c = f"{confidence_fn}.tmp"
+                with open(tmp_c, "w") as f:
+                    json.dump(confidence_records, f, indent=2)
+                os.replace(tmp_c, confidence_fn)
+        except Exception as e:
+            logger.warning(f"Incremental flush failed (non-fatal): {e}")
+
+    samples_seen = 0
     for sample in progress:
         sample = utils.move_to_cuda(sample) if use_cuda else sample
         if "net_input" not in sample:
@@ -235,7 +269,7 @@ def _main(cfg, output_file):
         if small_gpu and dynamic_max_len > 512:
             dynamic_max_len = 512
 
-        best_hypo = model.generate(target_list=sample["target"],
+        gen_out = model.generate(target_list=sample["target"],
                                    num_beams=cfg.generation.beam,
                                    max_length=dynamic_max_len,
                                    length_penalty=cfg.generation.lenpen,
@@ -245,8 +279,71 @@ def _main(cfg, output_file):
                                    temperature=cfg.generation.temperature,
                                    top_p=cfg.generation.top_p,
                                    **sample["net_input"])
+
+        # Unwrap dict-mode return when VSP_OUTPUT_SCORES=1 was set inside generate().
+        # In default (tensor) mode, gen_out IS the token-id tensor; preserve original behavior.
+        if hasattr(gen_out, "sequences"):
+            best_hypo_tokens = gen_out.sequences
+            seq_scores = (
+                gen_out.sequences_scores.float().cpu().numpy().tolist()
+                if getattr(gen_out, "sequences_scores", None) is not None
+                else [None] * best_hypo_tokens.size(0)
+            )
+            try:
+                trans_scores = model.decoder.compute_transition_scores(
+                    gen_out.sequences,
+                    gen_out.scores,
+                    getattr(gen_out, "beam_indices", None),
+                    normalize_logits=True,
+                )
+                # log-probs -> probs; shape [batch, gen_len]
+                token_probs = trans_scores.exp().float().cpu().numpy().tolist()
+            except Exception as e:
+                logger.warning(f"compute_transition_scores failed; saving sequence scores only: {e}")
+                token_probs = [None] * best_hypo_tokens.size(0)
+
+            # Per-step entropy + top-3 alternatives from the surviving best-beam
+            # distribution. Report 4 specifically calls out entropy as a better
+            # hallucination indicator than raw max-softmax. Top-3 lets us
+            # compute margin (top1-top2) and "rest of mass" downstream.
+            try:
+                # NOTE: `import torch` here would shadow the module-level torch
+                # and break earlier `torch.cuda.is_available()` calls. Use the
+                # already-imported torch and reach into torch.nn.functional.
+                _F = torch.nn.functional
+                n_beams = cfg.generation.beam
+                batch_size = best_hypo_tokens.size(0)
+                step_entropies = [[] for _ in range(batch_size)]
+                step_top3 = [[] for _ in range(batch_size)]
+                for step_scores in gen_out.scores:
+                    # step_scores: [batch * n_beams, vocab_size]. After HF beam
+                    # reordering at each step, indices [0, n_beams, 2*n_beams, ...]
+                    # correspond to the running best beam per batch item.
+                    best_beam_scores = step_scores[::n_beams]  # [batch, vocab]
+                    probs = _F.softmax(best_beam_scores, dim=-1)
+                    log_probs = _F.log_softmax(best_beam_scores, dim=-1)
+                    ent = -(probs * log_probs).sum(dim=-1)  # [batch]
+                    top3_p, top3_i = probs.topk(3, dim=-1)  # [batch, 3]
+                    for b in range(batch_size):
+                        step_entropies[b].append(float(ent[b].item()))
+                        step_top3[b].append([
+                            {"id": int(top3_i[b, k].item()),
+                             "p":  float(top3_p[b, k].item())}
+                            for k in range(3)
+                        ])
+            except Exception as e:
+                logger.warning(f"entropy/top-3 extraction failed: {e}")
+                step_entropies = [None] * best_hypo_tokens.size(0)
+                step_top3 = [None] * best_hypo_tokens.size(0)
+        else:
+            best_hypo_tokens = gen_out
+            seq_scores = [None] * best_hypo_tokens.size(0)
+            token_probs = [None] * best_hypo_tokens.size(0)
+            step_entropies = [None] * best_hypo_tokens.size(0)
+            step_top3 = [None] * best_hypo_tokens.size(0)
+
         best_hypo = tokenizer.batch_decode(
-                best_hypo, skip_special_tokens=True, clean_up_tokenization_spaces=False
+                best_hypo_tokens, skip_special_tokens=True, clean_up_tokenization_spaces=False
             )
         for i in range(len(sample["id"])):
             result_dict['utt_id'].append(sample['utt_id'][i])
@@ -261,6 +358,45 @@ def _main(cfg, output_file):
             result_dict['hypo'].append(hypo_str)
             logger.info(f"\nINST:{instruction}\nREF:{ref_sent}\nHYP:{hypo_str}\n")
 
+            if output_scores_enabled:
+                tok_ids = best_hypo_tokens[i].cpu().tolist()
+                # Use convert_ids_to_tokens (NOT decode) so SentencePiece word-start
+                # markers (U+2581 ▁) are preserved. The aggregator in
+                # compute_word_confidence.py relies on them to detect word boundaries.
+                tok_strs = tokenizer.convert_ids_to_tokens(tok_ids)
+                tok_probs_i = token_probs[i] if token_probs[i] is not None else [None] * len(tok_ids)
+                # Align lengths defensively (compute_transition_scores may drop the bos token).
+                pad_n = max(0, len(tok_ids) - len(tok_probs_i))
+                tok_probs_i = [None] * pad_n + list(tok_probs_i)
+                tok_probs_i = tok_probs_i[: len(tok_ids)]
+
+                # Entropy and top-3 alternatives from the per-step distribution.
+                # gen_out.scores has one entry per *generated* token (i.e., not
+                # for the BOS prepended by HF). Pad-align with token_probs.
+                ent_i  = step_entropies[i] if i < len(step_entropies) and step_entropies[i] else []
+                top3_i_ = step_top3[i]      if i < len(step_top3)      and step_top3[i]      else []
+                pad_e = max(0, len(tok_ids) - len(ent_i))
+                ent_aligned = [None] * pad_e + list(ent_i)
+                top3_aligned = [None] * pad_e + list(top3_i_)
+                ent_aligned = ent_aligned[: len(tok_ids)]
+                top3_aligned = top3_aligned[: len(tok_ids)]
+
+                tok_records = []
+                for k, (tid, tstr) in enumerate(zip(tok_ids, tok_strs)):
+                    rec = {
+                        "token_id": int(tid),
+                        "token": tstr,
+                        "prob": (float(tok_probs_i[k]) if tok_probs_i[k] is not None else None),
+                        "entropy": ent_aligned[k] if k < len(ent_aligned) else None,
+                        "top3": top3_aligned[k] if k < len(top3_aligned) else None,
+                    }
+                    tok_records.append(rec)
+
+                confidence_records[sample['utt_id'][i]] = {
+                    "sequence_score": seq_scores[i],
+                    "tokens": tok_records,
+                }
+
         # Free GPU memory between samples (prevents accumulation on 12GB GPUs)
         if use_cuda:
             torch.cuda.empty_cache()
@@ -269,11 +405,16 @@ def _main(cfg, output_file):
                 gc.collect()
                 torch.cuda.empty_cache()
 
-    yaml_str = OmegaConf.to_yaml(cfg.generation)
-    fid = int(hashlib.md5(yaml_str.encode("utf-8")).hexdigest(), 16)
-    fid = fid % 1000000
-    result_fn = f"{cfg.common_eval.results_path}/hypo-{fid}.json"
-    json.dump(result_dict, open(result_fn, 'w'), indent=4)
+        samples_seen += len(sample["id"])
+        if flush_every > 0 and samples_seen % flush_every == 0:
+            _flush_partial()
+            logger.info(f"Incremental flush at {samples_seen} samples → {hypo_fn}")
+
+    # Final flush — the canonical full dump. Uses the same path as partial
+    # flushes, overwriting them with the complete result.
+    _flush_partial()
+    if output_scores_enabled and confidence_records:
+        logger.info(f"Saved per-token confidence sidecar to {confidence_fn} ({len(confidence_records)} segments)")
 
     # Save effective decode parameters for report documentation
     try:
