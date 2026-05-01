@@ -228,8 +228,16 @@ def _main(cfg, output_file):
     result_dict = {'utt_id': [], 'ref': [], 'hypo': [], 'instruction': []}
     model = models[0]
 
+    nbest_enabled = os.environ.get("VSP_NBEST", "0") == "1"
+    # n-best capture requires per-token probs/entropy. If the user opts into
+    # n-best but forgets to also set output-scores, force it on (matches the
+    # behavioral coupling in vsp_llm.generate()).
+    if nbest_enabled and os.environ.get("VSP_OUTPUT_SCORES", "0") != "1":
+        os.environ["VSP_OUTPUT_SCORES"] = "1"
+        logger.info("VSP_NBEST=1 requires per-token probs; forcing VSP_OUTPUT_SCORES=1")
     output_scores_enabled = os.environ.get("VSP_OUTPUT_SCORES", "0") == "1"
-    confidence_records = {}  # utt_id -> {seq_score, tokens: [{token, prob}]}
+    confidence_records = {}  # utt_id -> {seq_score, tokens: [{token, prob}]} (top-1)
+    nbest_records = {}       # utt_id -> {hypotheses: [{rank, text, sequence_score, raw_logprob_sum, tokens: [...]}]}
 
     # Pre-compute the file id so partial flushes can write to the same files
     # the final dump uses. fid is deterministic from cfg.generation, so this
@@ -239,6 +247,7 @@ def _main(cfg, output_file):
     results_path = cfg.common_eval.results_path
     hypo_fn = f"{results_path}/hypo-{fid}.json"
     confidence_fn = f"{results_path}/confidence-{fid}.json"
+    nbest_fn = f"{results_path}/nbest-{fid}.json"
 
     # Atomic, crash-resilient incremental flush. Writes the *current* in-memory
     # dicts to a .tmp file, then os.replace into place — so a kill mid-write
@@ -257,6 +266,11 @@ def _main(cfg, output_file):
                 with open(tmp_c, "w") as f:
                     json.dump(confidence_records, f, indent=2)
                 os.replace(tmp_c, confidence_fn)
+            if nbest_enabled and nbest_records:
+                tmp_n = f"{nbest_fn}.tmp"
+                with open(tmp_n, "w") as f:
+                    json.dump(nbest_records, f, indent=2)
+                os.replace(tmp_n, nbest_fn)
         except Exception as e:
             logger.warning(f"Incremental flush failed (non-fatal): {e}")
 
@@ -291,61 +305,97 @@ def _main(cfg, output_file):
 
         # Unwrap dict-mode return when VSP_OUTPUT_SCORES=1 was set inside generate().
         # In default (tensor) mode, gen_out IS the token-id tensor; preserve original behavior.
+        # n_per is the number of returned sequences per batch item:
+        #   - VSP_NBEST=0: n_per=1 (top-1 only, legacy)
+        #   - VSP_NBEST=1: n_per=num_beams (all surviving beams, ranked best-first)
         if hasattr(gen_out, "sequences"):
-            best_hypo_tokens = gen_out.sequences
-            seq_scores = (
-                gen_out.sequences_scores.float().cpu().numpy().tolist()
-                if getattr(gen_out, "sequences_scores", None) is not None
-                else [None] * best_hypo_tokens.size(0)
-            )
+            seqs_all = gen_out.sequences  # [batch * n_per, gen_len]
+            n_seqs = seqs_all.size(0)
+            batch_size = len(sample["id"])
+            n_per = max(1, n_seqs // batch_size)
+
+            # sequences_scores: length-normalized log-prob; shape [n_seqs]
+            if getattr(gen_out, "sequences_scores", None) is not None:
+                seq_scores_all = gen_out.sequences_scores.float().cpu().numpy().tolist()
+            else:
+                seq_scores_all = [None] * n_seqs
+
+            # Per-token probs via beam_indices-aware compute_transition_scores.
+            # When num_return_sequences=num_beams, this returns [n_seqs, gen_len]
+            # already aligned to each surviving sequence (HF follows beam_indices
+            # internally). Sum across positions gives the raw (un-length-normalized)
+            # log-prob if we want it for MBR weighting.
             try:
                 trans_scores = model.decoder.compute_transition_scores(
-                    gen_out.sequences,
+                    seqs_all,
                     gen_out.scores,
                     getattr(gen_out, "beam_indices", None),
                     normalize_logits=True,
-                )
-                # log-probs -> probs; shape [batch, gen_len]
-                token_probs = trans_scores.exp().float().cpu().numpy().tolist()
+                )  # log-probs [n_seqs, gen_len]
+                token_probs_all = trans_scores.exp().float().cpu().numpy().tolist()
+                # Raw sum-of-log-probs per sequence (ignores -inf padding for finished beams).
+                raw_logprob_sum_all = []
+                for s in range(n_seqs):
+                    finite = [lp for lp in trans_scores[s].cpu().numpy().tolist() if math.isfinite(lp)]
+                    raw_logprob_sum_all.append(float(sum(finite)) if finite else None)
             except Exception as e:
                 logger.warning(f"compute_transition_scores failed; saving sequence scores only: {e}")
-                token_probs = [None] * best_hypo_tokens.size(0)
+                token_probs_all = [None] * n_seqs
+                raw_logprob_sum_all = [None] * n_seqs
 
-            # Per-step entropy + top-3 alternatives from the surviving best-beam
-            # distribution. Report 4 specifically calls out entropy as a better
-            # hallucination indicator than raw max-softmax. Top-3 lets us
-            # compute margin (top1-top2) and "rest of mass" downstream.
+            # Per-step entropy + top-3 alternatives, gathered via beam_indices so
+            # the distribution is correctly attributed to each surviving sequence
+            # (HF reorders beams between steps; the previous step_scores[::n_beams]
+            # stride was incorrect because beam-0 is not always the running-best).
+            # Works for both top-1 (n_per=1) and n-best (n_per=num_beams).
             try:
-                # NOTE: `import torch` here would shadow the module-level torch
-                # and break earlier `torch.cuda.is_available()` calls. Use the
-                # already-imported torch and reach into torch.nn.functional.
                 _F = torch.nn.functional
-                n_beams = cfg.generation.beam
-                batch_size = best_hypo_tokens.size(0)
-                step_entropies = [[] for _ in range(batch_size)]
-                step_top3 = [[] for _ in range(batch_size)]
-                for step_scores in gen_out.scores:
-                    # step_scores: [batch * n_beams, vocab_size]. After HF beam
-                    # reordering at each step, indices [0, n_beams, 2*n_beams, ...]
-                    # correspond to the running best beam per batch item.
-                    best_beam_scores = step_scores[::n_beams]  # [batch, vocab]
-                    probs = _F.softmax(best_beam_scores, dim=-1)
-                    log_probs = _F.log_softmax(best_beam_scores, dim=-1)
-                    ent = -(probs * log_probs).sum(dim=-1)  # [batch]
-                    top3_p, top3_i = probs.topk(3, dim=-1)  # [batch, 3]
-                    for b in range(batch_size):
-                        step_entropies[b].append(float(ent[b].item()))
-                        step_top3[b].append([
-                            {"id": int(top3_i[b, k].item()),
-                             "p":  float(top3_p[b, k].item())}
-                            for k in range(3)
-                        ])
+                beam_indices = getattr(gen_out, "beam_indices", None)
+                step_entropies_all = [[] for _ in range(n_seqs)]
+                step_top3_all = [[] for _ in range(n_seqs)]
+                if beam_indices is not None and gen_out.scores is not None:
+                    gen_len_t = len(gen_out.scores)
+                    bi_len = beam_indices.size(1) if beam_indices.dim() == 2 else 0
+                    for t in range(gen_len_t):
+                        step_scores = gen_out.scores[t]  # [batch * n_beams, vocab]
+                        probs = _F.softmax(step_scores, dim=-1)
+                        log_probs = _F.log_softmax(step_scores, dim=-1)
+                        ent = -(probs * log_probs).sum(dim=-1)  # [batch * n_beams]
+                        top3_p, top3_i = probs.topk(3, dim=-1)  # [batch * n_beams, 3]
+                        for s in range(n_seqs):
+                            bi = int(beam_indices[s, t].item()) if t < bi_len else -1
+                            if bi < 0 or bi >= step_scores.size(0):
+                                # Step is past EOS / padded for this sequence.
+                                step_entropies_all[s].append(None)
+                                step_top3_all[s].append(None)
+                            else:
+                                step_entropies_all[s].append(float(ent[bi].item()))
+                                step_top3_all[s].append([
+                                    {"id": int(top3_i[bi, k].item()),
+                                     "p":  float(top3_p[bi, k].item())}
+                                    for k in range(3)
+                                ])
             except Exception as e:
                 logger.warning(f"entropy/top-3 extraction failed: {e}")
-                step_entropies = [None] * best_hypo_tokens.size(0)
-                step_top3 = [None] * best_hypo_tokens.size(0)
+                step_entropies_all = [None] * n_seqs
+                step_top3_all = [None] * n_seqs
+
+            # Top-1 (rank-0) views per batch item — preserves the legacy
+            # confidence sidecar shape and the tokenizer.batch_decode call below.
+            best_hypo_tokens = seqs_all[::n_per]  # [batch, gen_len]
+            seq_scores = [seq_scores_all[i * n_per] for i in range(batch_size)]
+            token_probs = [token_probs_all[i * n_per] if token_probs_all is not None else None for i in range(batch_size)]
+            step_entropies = [step_entropies_all[i * n_per] for i in range(batch_size)]
+            step_top3 = [step_top3_all[i * n_per] for i in range(batch_size)]
         else:
             best_hypo_tokens = gen_out
+            n_per = 1
+            seqs_all = best_hypo_tokens
+            seq_scores_all = [None] * best_hypo_tokens.size(0)
+            token_probs_all = [None] * best_hypo_tokens.size(0)
+            raw_logprob_sum_all = [None] * best_hypo_tokens.size(0)
+            step_entropies_all = [None] * best_hypo_tokens.size(0)
+            step_top3_all = [None] * best_hypo_tokens.size(0)
             seq_scores = [None] * best_hypo_tokens.size(0)
             token_probs = [None] * best_hypo_tokens.size(0)
             step_entropies = [None] * best_hypo_tokens.size(0)
@@ -406,6 +456,55 @@ def _main(cfg, output_file):
                     "tokens": tok_records,
                 }
 
+            # n-best capture: per-utterance hypothesis list with per-token probs
+            # for each surviving beam. Top-1 (rank 0) text matches result_dict['hypo'][i]
+            # by construction (same seqs_all[::n_per] subset).
+            if nbest_enabled:
+                hyps = []
+                for r in range(n_per):
+                    s_idx = i * n_per + r
+                    seq_tokens = seqs_all[s_idx].cpu().tolist()
+                    text_r = tokenizer.decode(
+                        seqs_all[s_idx], skip_special_tokens=True, clean_up_tokenization_spaces=False
+                    )
+                    tstrs = tokenizer.convert_ids_to_tokens(seq_tokens)
+
+                    tp_r = token_probs_all[s_idx] if token_probs_all and token_probs_all[s_idx] is not None else [None] * len(seq_tokens)
+                    pad_n = max(0, len(seq_tokens) - len(tp_r))
+                    tp_r = [None] * pad_n + list(tp_r)
+                    tp_r = tp_r[: len(seq_tokens)]
+
+                    ent_r  = step_entropies_all[s_idx] if step_entropies_all[s_idx] else []
+                    top3_r = step_top3_all[s_idx]      if step_top3_all[s_idx]      else []
+                    pad_e = max(0, len(seq_tokens) - len(ent_r))
+                    ent_r = [None] * pad_e + list(ent_r)
+                    top3_r = [None] * pad_e + list(top3_r)
+                    ent_r = ent_r[: len(seq_tokens)]
+                    top3_r = top3_r[: len(seq_tokens)]
+
+                    tok_recs_r = []
+                    for k, (tid, tstr) in enumerate(zip(seq_tokens, tstrs)):
+                        # Filter out -inf log-prob tokens (post-EOS padding)
+                        p = tp_r[k]
+                        if p is not None and not math.isfinite(float(p)):
+                            p = None
+                        tok_recs_r.append({
+                            "token_id": int(tid),
+                            "token": tstr,
+                            "prob": (float(p) if p is not None else None),
+                            "entropy": ent_r[k] if k < len(ent_r) else None,
+                            "top3": top3_r[k] if k < len(top3_r) else None,
+                        })
+
+                    hyps.append({
+                        "rank": r,
+                        "text": text_r,
+                        "sequence_score": seq_scores_all[s_idx],
+                        "raw_logprob_sum": raw_logprob_sum_all[s_idx] if s_idx < len(raw_logprob_sum_all) else None,
+                        "tokens": tok_recs_r,
+                    })
+                nbest_records[sample['utt_id'][i]] = {"hypotheses": hyps}
+
         # Free GPU memory between samples (prevents accumulation on 12GB GPUs)
         if use_cuda:
             torch.cuda.empty_cache()
@@ -424,6 +523,9 @@ def _main(cfg, output_file):
     _flush_partial()
     if output_scores_enabled and confidence_records:
         logger.info(f"Saved per-token confidence sidecar to {confidence_fn} ({len(confidence_records)} segments)")
+    if nbest_enabled and nbest_records:
+        n_per_eff = len(next(iter(nbest_records.values()))["hypotheses"]) if nbest_records else 0
+        logger.info(f"Saved n-best sidecar to {nbest_fn} ({len(nbest_records)} segments × {n_per_eff} hypotheses)")
 
     # Save effective decode parameters for report documentation
     try:
@@ -461,7 +563,7 @@ def _main(cfg, output_file):
         with open(wer_fn, "w") as fo:
             fo.write(f"WER: {wer}\n")
             fo.write(f"err / num_ref_words = {n_err} / {n_total}\n\n")
-            fo.write(f"{yaml_str}")
+            fo.write(f"{_yaml_str}")
         logger.info(f"WER: {wer}%")
     else:
         bleu = sacrebleu.corpus_bleu(result_dict['hypo'], [result_dict['ref']])
@@ -469,7 +571,7 @@ def _main(cfg, output_file):
         bleu_fn = f"{cfg.common_eval.results_path}/bleu.{fid}"
         with open(bleu_fn, "w") as fo:
             fo.write(f"BLEU: {bleu_score}\n")
-            fo.write(f"{yaml_str}")
+            fo.write(f"{_yaml_str}")
         logger.info(f"BLEU: {bleu_score}\n")
     return
 

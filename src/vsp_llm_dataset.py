@@ -193,6 +193,17 @@ class VSP_LLM_dataset(FairseqDataset):
         self.noise_wav, self.noise_prob, self.noise_snr, self.noise_num = [ln.strip() for ln in open(noise_fn).readlines()] if noise_fn is not None else [], noise_prob, noise_snr, noise_num
         self.lang_dict = {'en':"English", 'es':"Spanish", 'fr':"French", 'it':'Italian', 'pt':"Portuguese"}
 
+        # Topic label injection: load per-segment topic labels if VSP_TOPIC_FILE is set
+        topic_file = os.environ.get("VSP_TOPIC_FILE", "")
+        if topic_file and os.path.isfile(topic_file):
+            with open(topic_file) as tf:
+                all_topics = [line.strip() for line in tf]
+            # Filter to same indices as the loaded data
+            self.topic_labels = [all_topics[i] for i in inds]
+            logger.info(f"Loaded {len(self.topic_labels)} topic labels from {topic_file}")
+        else:
+            self.topic_labels = None
+
         assert self.single_target == (self.label_rates[0] == -1), f"single target should be equivalent to sequence label (label_rate==-1)"
         if store_labels:
             self.label_list = [load_label(p, inds, tot) for p in label_paths]
@@ -398,7 +409,12 @@ class VSP_LLM_dataset(FairseqDataset):
                 "pt": "Portuguese",
             }
             lang_name = lang_name_map.get(lang_code, lang_code)
-            instruction = f"Recognize this speech in {lang_name}. Input : "
+            # Inject topic label if available
+            if self.topic_labels is not None and self.topic_labels[index]:
+                topic = self.topic_labels[index]
+                instruction = f"The speaker is discussing {topic}. Recognize this speech in {lang_name}. Input : "
+            else:
+                instruction = f"Recognize this speech in {lang_name}. Input : "
         else:
             # translation (VST)
             instruction = (
